@@ -1,0 +1,53 @@
+# Build outputs and local dependencies
+/.tools/
+/bin/
+/build/
+/dist/
+/out/
+/target/
+/.zig-cache/
+/zig-cache/
+/zig-out/
+/vendor/
+/node_modules/
+
+# Local design notes, hardware traces and measurements
+/docs/
+
+# IDE and local configuration
+/.vs/
+/.vscode/
+/.idea/
+/.agents/
+/.codex/
+*.user
+*.suo
+.env
+.env.*
+
+# Generated binaries, intermediates, logs and archives
+*.exe
+*.dll
+*.obj
+*.o
+*.a
+*.lib
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.pch
+*.res
+*.log
+*.tmp
+*.zip
+*.7z
+*.tar
+*.gz
+*.bmp
+*.png
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
