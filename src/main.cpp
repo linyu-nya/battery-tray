@@ -2,6 +2,7 @@
 #include "icon_font.h"
 #include "icon_pixels.h"
 #include "refresh_policy.h"
+#include "startup.h"
 #include <shellapi.h>
 #include <imm.h>
 #include <dbt.h>
@@ -10,10 +11,9 @@
 
 namespace {
 constexpr wchar_t ClassName[]=L"LogiBatteryTray.Native.v1";
-constexpr UINT TrayMessage=WM_APP+1,Updated=WM_APP+2;
+constexpr UINT TrayMessage=WM_APP+1,Updated=WM_APP+2,StartupUpdated=WM_APP+3;
 constexpr UINT Refresh=10,Startup=20,Exit=30;
-constexpr wchar_t RunKey[]=L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-HANDLE stopEvent=nullptr,refreshEvent=nullptr,workerThread=nullptr;
+HANDLE stopEvent=nullptr,refreshEvent=nullptr,workerThread=nullptr,startupThread=nullptr;
 CRITICAL_SECTION stateLock;
 Reading shared,current,lastGood;
 HWND window=nullptr;
@@ -21,6 +21,36 @@ HICON currentIcon=nullptr;
 UINT taskbarCreated=0;
 bool trayAdded=false;
 HDEVNOTIFY deviceNotification=nullptr;
+startup::State startupState=startup::State::Unavailable;
+enum class StartupOperation { Inspect,Enable,Disable };
+bool startupBusy=false,startupChanging=false;
+ULONGLONG lastStartupCheck=0;
+HMENU visibleMenu=nullptr;
+const wchar_t* startupLabel() {
+    if(startupBusy)return startupChanging?L"开机启动（设置中…）":L"开机启动（检查中…）";
+    return startupState==startup::State::Unavailable?L"开机启动（检查失败）":
+        startupState==startup::State::WindowsDisabled?L"开机启动（Windows 已禁用）":
+        startupState==startup::State::OtherPath?L"开机启动（更新程序路径）":L"开机启动";
+}
+UINT startupFlags() {
+    return MF_STRING|(startupState==startup::State::On?MF_CHECKED:0)|(startupBusy?MF_GRAYED:0);
+}
+DWORD WINAPI startupWorker(void* argument) {
+    auto operation=static_cast<StartupOperation>(reinterpret_cast<ULONG_PTR>(argument));
+    startup::State result=operation==StartupOperation::Inspect?startup::inspect(stopEvent):
+        operation==StartupOperation::Enable?startup::turnOn(stopEvent):startup::turnOff(stopEvent);
+    if(WaitForSingleObject(stopEvent,0)!=WAIT_OBJECT_0)
+        PostMessageW(window,StartupUpdated,static_cast<WPARAM>(result),static_cast<LPARAM>(operation));
+    return 0;
+}
+bool beginStartupOperation(StartupOperation operation) {
+    if(startupBusy)return false;
+    if(startupThread){CloseHandle(startupThread);startupThread=nullptr;}
+    startupBusy=true;startupChanging=operation!=StartupOperation::Inspect;
+    startupThread=CreateThread(nullptr,0,startupWorker,reinterpret_cast<void*>(static_cast<ULONG_PTR>(operation)),0,nullptr);
+    if(!startupThread){startupBusy=false;startupChanging=false;startupState=startup::State::Unavailable;return false;}
+    return true;
+}
 const wchar_t* chargeText(BYTE status) {
     switch(status) {
         case 0:return L"使用电池"; case 1:case 2:case 4:return L"充电中";
@@ -33,24 +63,6 @@ const wchar_t* levelText(BYTE level) {
 }
 std::wstring batteryText(const Battery& b) {
     return b.percent>=0 ? std::wstring(b.exact?L"":L"约 ")+std::to_wstring(b.percent)+L"%" : std::wstring(L"电量档位：")+levelText(b.level);
-}
-bool autoStartEnabled() {
-    wchar_t saved[32768]{}; DWORD size=sizeof(saved),type=0;
-    if(RegGetValueW(HKEY_CURRENT_USER,RunKey,L"LogiBatteryTray",RRF_RT_REG_SZ,&type,saved,&size)!=ERROR_SUCCESS) return false;
-    wchar_t path[32768]{}; if(!GetModuleFileNameW(nullptr,path,32768)) return false;
-    return std::wstring(saved)==L"\""+std::wstring(path)+L"\"";
-}
-bool setAutoStart(bool enabled) {
-    HKEY key=nullptr;
-    if(RegCreateKeyExW(HKEY_CURRENT_USER,RunKey,0,nullptr,0,KEY_SET_VALUE,nullptr,&key,nullptr)!=ERROR_SUCCESS) return false;
-    LSTATUS result;
-    if(enabled) {
-        wchar_t path[32768]{}; DWORD length=GetModuleFileNameW(nullptr,path,32768);
-        if(!length || length>=32768) { RegCloseKey(key);return false; }
-        std::wstring value=L"\""+std::wstring(path)+L"\"";
-        result=RegSetValueExW(key,L"LogiBatteryTray",0,REG_SZ,reinterpret_cast<const BYTE*>(value.c_str()),static_cast<DWORD>((value.size()+1)*sizeof(wchar_t)));
-    } else result=RegDeleteValueW(key,L"LogiBatteryTray");
-    RegCloseKey(key); return result==ERROR_SUCCESS || (!enabled && result==ERROR_FILE_NOT_FOUND);
 }
 HICON makeIcon(const Reading& reading) {
     int size=GetSystemMetrics(SM_CXSMICON); if(size<16) size=16;
@@ -115,19 +127,35 @@ DWORD WINAPI worker(void*) {
 }
 void showMenu() {
     HMENU menu=CreatePopupMenu();if(!menu) return;
+    if(!startupBusy && (!lastStartupCheck || GetTickCount64()-lastStartupCheck>30000))
+        beginStartupOperation(StartupOperation::Inspect);
     std::wstring status=current.online?current.name+L" · "+batteryText(current.battery):L"当前未读到电量";
     AppendMenuW(menu,MF_STRING|MF_DISABLED,0,status.c_str());AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
     AppendMenuW(menu,MF_STRING,Refresh,L"立即刷新（默认每 5 分钟更新）");
-    AppendMenuW(menu,MF_STRING|(autoStartEnabled()?MF_CHECKED:0),Startup,L"开机启动");
+    AppendMenuW(menu,startupFlags(),Startup,startupLabel());
     AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,Exit,L"退出");
     POINT cursor;GetCursorPos(&cursor);SetForegroundWindow(window);
+    visibleMenu=menu;
     UINT command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,cursor.x,cursor.y,0,window,nullptr);
-    DestroyMenu(menu);PostMessageW(window,WM_NULL,0,0);
+    visibleMenu=nullptr;DestroyMenu(menu);PostMessageW(window,WM_NULL,0,0);
     if(command) PostMessageW(window,WM_COMMAND,command,0);
 }
 LRESULT CALLBACK windowProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
     if(taskbarCreated && message==taskbarCreated) {trayAdded=false;updateTray(true);return 0;}
     switch(message) {
+        case StartupUpdated: {
+            startupState=static_cast<startup::State>(wp);startupBusy=false;startupChanging=false;
+            lastStartupCheck=GetTickCount64();
+            if(visibleMenu){ModifyMenuW(visibleMenu,Startup,MF_BYCOMMAND|startupFlags(),Startup,startupLabel());DrawMenuBar(hwnd);}
+            auto operation=static_cast<StartupOperation>(lp);
+            if(operation!=StartupOperation::Inspect) {
+                if(startupState==startup::State::WindowsDisabled)
+                    MessageBoxW(hwnd,L"Windows 已禁用此启动项，请在系统“设置 → 应用 → 启动”中启用。",L"Battery Tray",MB_OK|MB_ICONINFORMATION);
+                else if(startupState!=(operation==StartupOperation::Disable?startup::State::Off:startup::State::On))
+                    MessageBoxW(hwnd,L"无法确认开机启动设置已生效。请稍后重试；程序不会将未验证的状态标记为已开启。",L"Battery Tray",MB_OK|MB_ICONERROR);
+            }
+            return 0;
+        }
         case Updated:
             EnterCriticalSection(&stateLock);current=shared;LeaveCriticalSection(&stateLock);
             if(current.online) lastGood=current;
@@ -138,7 +166,10 @@ LRESULT CALLBACK windowProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
             return 0;
         case WM_COMMAND:
             if(LOWORD(wp)==Refresh) SetEvent(refreshEvent);
-            else if(LOWORD(wp)==Startup) {if(!setAutoStart(!autoStartEnabled())) MessageBoxW(hwnd,L"无法修改开机启动设置。",L"LogiBattery",MB_OK|MB_ICONERROR);}
+            else if(LOWORD(wp)==Startup) {
+                if(!startupBusy && !beginStartupOperation(startupState==startup::State::On?StartupOperation::Disable:StartupOperation::Enable))
+                    MessageBoxW(hwnd,L"无法启动设置检查，请稍后重试。",L"Battery Tray",MB_OK|MB_ICONERROR);
+            }
             else if(LOWORD(wp)==Exit) PostMessageW(hwnd,WM_CLOSE,0,0);
             return 0;
         case WM_DEVICECHANGE:
@@ -153,6 +184,7 @@ LRESULT CALLBACK windowProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         case WM_ENDSESSION:if(wp) PostMessageW(hwnd,WM_CLOSE,0,0);return 0;
         case WM_CLOSE:
             SetEvent(stopEvent);WaitForSingleObject(workerThread,INFINITE);
+            if(startupThread)WaitForSingleObject(startupThread,INFINITE);
             if(deviceNotification) {UnregisterDeviceNotification(deviceNotification);deviceNotification=nullptr;}
             {NOTIFYICONDATAW data{};data.cbSize=sizeof(data);data.hWnd=hwnd;data.uID=1;Shell_NotifyIconW(NIM_DELETE,&data);}
             if(currentIcon) {DestroyIcon(currentIcon);currentIcon=nullptr;}
@@ -166,6 +198,8 @@ int main(int argc,char** argv) {
     // This process has no text input. Opt out before any top-level window is
     // created so TSF/third-party IMEs do not load their engines into the tray.
     ImmDisableIME(static_cast<DWORD>(-1));
+    if(argc==2 && (strcmp(argv[1],"--startup-query")==0 || strcmp(argv[1],"--startup-enable")==0 || strcmp(argv[1],"--startup-disable")==0))
+        return static_cast<int>(startup::runHelper(argv[1]));
     if(argc>1 && (strcmp(argv[1],"--quit")==0 || strcmp(argv[1],"--refresh")==0)) {
         HWND existing=FindWindowW(ClassName,nullptr);
         if(!existing) return 3;
@@ -194,8 +228,9 @@ int main(int argc,char** argv) {
     deviceNotification=RegisterDeviceNotificationW(window,&filter,DEVICE_NOTIFY_WINDOW_HANDLE|DEVICE_NOTIFY_ALL_INTERFACE_CLASSES);
     current.error=L"正在读取鼠标电量…";updateTray(true);
     workerThread=CreateThread(nullptr,0,worker,nullptr,0,nullptr);
+    beginStartupOperation(StartupOperation::Inspect);
     if(!workerThread) {MessageBoxW(nullptr,L"无法启动读取线程。",L"LogiBattery",MB_OK|MB_ICONERROR);PostMessageW(window,WM_CLOSE,0,0);}
     MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0) {TranslateMessage(&msg);DispatchMessageW(&msg);}
-    if(workerThread) CloseHandle(workerThread);CloseHandle(stopEvent);CloseHandle(refreshEvent);CloseHandle(mutex);DeleteCriticalSection(&stateLock);
+    if(workerThread) CloseHandle(workerThread);if(startupThread)CloseHandle(startupThread);CloseHandle(stopEvent);CloseHandle(refreshEvent);CloseHandle(mutex);DeleteCriticalSection(&stateLock);
     return 0;
 }

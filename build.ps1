@@ -24,6 +24,21 @@ if ($LASTEXITCODE -ne 0) { throw 'Protocol tests failed' }
 if ($LASTEXITCODE -ne 0) { throw 'Recovery test compilation failed' }
 & .\build\recovery_test.exe
 if ($LASTEXITCODE -ne 0) { throw 'Recovery tests failed' }
+& $zig c++ @flags tests/startup_policy_test.cpp -o build/startup_policy_test.exe
+if ($LASTEXITCODE -ne 0) { throw 'Startup policy compilation failed' }
+& .\build\startup_policy_test.exe
+if ($LASTEXITCODE -ne 0) { throw 'Startup policy tests failed' }
+& $zig c++ @flags tests/startup_system_test.cpp -o build/startup_system_test.exe -lwbemuuid
+if ($LASTEXITCODE -ne 0) { throw 'Startup system test compilation failed' }
+& .\tests\startup_system_test.ps1
+& $zig c++ @flags tests/startup_helper_test.cpp src/startup.cpp -o build/startup_helper_test.exe -lwbemuuid
+if ($LASTEXITCODE -ne 0) { throw 'Startup helper compilation failed' }
+& .\build\startup_helper_test.exe
+if ($LASTEXITCODE -ne 0) { throw 'Startup helper tests failed' }
+& $zig c++ @flags tests/startup_ui_test.cpp src/hid_device.cpp src/startup.cpp -o build/startup_ui_test.exe -lsetupapi -lhid -lshell32 -lgdi32 -ladvapi32 -luser32 -limm32 -lwbemuuid
+if ($LASTEXITCODE -ne 0) { throw 'Startup UI test compilation failed' }
+& .\build\startup_ui_test.exe
+if ($LASTEXITCODE -ne 0) { throw 'Startup UI tests failed' }
 & $zig c++ @flags tests/icon_test.cpp -o build/icon_test.exe -lgdi32 -luser32
 if ($LASTEXITCODE -ne 0) { throw 'Icon test compilation failed' }
 & .\build\icon_test.exe
@@ -37,7 +52,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Transport test compilation failed' }
 & .\build\transport_test.exe
 if ($LASTEXITCODE -ne 0) { throw 'Transport tests failed' }
 if (!$TestsOnly) {
-    & $zig c++ @flags -s '-Wl,--subsystem,windows' src/main.cpp src/hid_device.cpp -o $Output -lsetupapi -lhid -lshell32 -lgdi32 -ladvapi32 -luser32 -limm32
+    & $zig c++ @flags -s '-Wl,--subsystem,windows' src/main.cpp src/hid_device.cpp src/startup.cpp -o $Output -lsetupapi -lhid -lshell32 -lgdi32 -ladvapi32 -luser32 -limm32 -lwbemuuid
     if ($LASTEXITCODE -ne 0) { throw 'Application compilation failed' }
     Get-Item -LiteralPath $Output | Select-Object FullName,Length
 }
